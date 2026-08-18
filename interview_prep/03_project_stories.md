@@ -18,32 +18,57 @@
 "I'm building the gold layer on a Databricks Lakeflow pipeline — PySpark DataFrame transforms on top of a CDC-driven SCD2 silver layer, deployed via Asset Bundles to Unity Catalog."
 
 ### Full Story
-> "The pipeline starts at SQL Server on-premise. SQL Server CDC tracks every insert, update, and delete at the row level by reading the transaction log — no triggers, no polling, just log-based change capture. Those change events land in S3 as Parquet files.
+> "The pipeline starts at SQL Server on-premise. The source uses SQL Server Change Tracking — not CDC. Change Tracking is lighter than CDC: it records that a row changed and its primary key, but not the full before/after image. It's sufficient here because the snapshot provides the full row data on the initial load, and CT only needs to track what changed after that.
 >
-> Auto Loader picks them up from S3 using file notifications — S3 event notifications trigger it the moment a new file lands, so it doesn't have to list the directory every run. It's push-based, not poll-based. Auto Loader feeds into Lakeflow Declarative Pipelines.
+> Two types of files land in S3 as Parquet: snapshot files — a full table extract run once — and change tracking files that arrive incrementally as rows change in SQL Server.
 >
-> The silver layer applies SCD2 using `APPLY CHANGES INTO`. For each table it tracks inserts and updates with `__IS_CURRENT`, `__START_AT`, `__END_AT`, and `__SK_ID` columns, giving full row history. This layer covers 147 TRUX tables and is managed by the platform team.
+> The silver layer has a two-flow design per table. Auto Loader reads both file types as streaming sources using `cloudFiles` format with `addNewColumns` schema evolution — so if a new column appears in the source, the pipeline adapts automatically without breaking. A `rescuedDataColumn` catches any fields that don't fit the current schema rather than losing them.
 >
-> My ownership is the gold layer. I take silver tables and build business-ready dimensional models — joining dimension tables, renaming columns to business terminology, filtering to current records using `__IS_CURRENT = true`. I write these as PySpark DataFrame transforms deployed via Asset Bundles to Unity Catalog. The gold layer feeds Tableau directly."
+> The first flow — the initial load — reads the snapshot files and runs once using `once=True`. It seeds the SCD2 staging table with the full historical state. The second flow — the CT flow — runs continuously, picking up change tracking files as they arrive. It maps SQL Server change tracking operation codes to DLT actions: operation 1 means delete, operation 3 is the before-image of an update which gets filtered out to avoid double-processing.
+>
+> Both flows feed into `create_auto_cdc_flow` which implements SCD2 — each flow passes a `sequence_by` struct containing commit time and LSN values so Databricks can order changes correctly and maintain the `__IS_CURRENT`, `__START_AT`, `__END_AT`, `__SK_ID` columns. LSN — Log Sequence Number — is SQL Server's transaction ordering mechanism, ensuring changes are applied in the exact order they happened at the source.
+>
+> This layer covers 147 TRUX tables and is managed by the platform team. My ownership is the gold layer — I take the silver SCD2 tables, filter `__IS_CURRENT = true`, join dimension tables, rename columns to business terminology, and deploy as PySpark DataFrame transforms via Asset Bundles to Unity Catalog. The gold layer feeds Tableau directly."
 
 ### When They Probe Deeper
 
-**"How exactly does CDC work?"**
-> "SQL Server CDC reads the transaction log — every committed transaction writes to the log before hitting the actual table. CDC captures those log entries as change events: the operation type (insert/update/delete), the before and after image of the row, and a sequence number. It's asynchronous — it doesn't slow down the source table."
+**"What's the difference between CDC and Change Tracking?"**
+> "CDC — Change Data Capture — reads the SQL Server transaction log and captures the full before and after image of every changed row. Change Tracking is lighter — it only records that a row changed and which primary key was affected, not the full row content. We use Change Tracking because the snapshot gives us the full initial state; incremental updates only need the key to know what to re-fetch or apply."
 
-**"How does Auto Loader work?"**
-> "Auto Loader has two modes. File notification mode — which we use — sets up S3 event notifications so the moment a file lands, Auto Loader is triggered. Directory listing mode polls the folder on a schedule. File notification is more efficient at scale. Auto Loader tracks processed files via a checkpoint so it never reprocesses the same file, even after a restart."
+**"Why two separate flows — snapshot and CT?"**
+> "The snapshot is a one-time full load that seeds the SCD2 table with all historical data. Running it continuously would re-process every row on every run — imagine extracting 10 million rows every hour just to find 500 that changed. The CT flow then takes over for ongoing changes — it's incremental and continuous. The `once=True` flag on the snapshot flow ensures it runs exactly once and never again."
+
+**"Can you walk me through a concrete example?"**
+> "Say the source is a `drivers` table with 3 rows on day 1. The snapshot runs once and loads all 3 rows into the SCD2 silver table — all with `__IS_CURRENT = true`.
+>
+> On day 5, Bob's status changes to Inactive in SQL Server. Change Tracking records that driver_id 2 changed, along with the operation code 4 — after-image of an update. The CT Parquet file that lands in S3 contains the full updated row. The CT flow picks it up, closes Bob's old row by setting `__IS_CURRENT = false` and stamping `__END_AT`, and inserts a new current row with the updated status.
+>
+> On day 8, Charlie is deleted. CT records operation code 1 — delete. The CT flow sees `apply_as_deletes` is set for operation 1, so Charlie's row gets closed with no new row inserted — he exists in history but has no current record.
+>
+> At any point the silver table has the full picture — because it was seeded from the snapshot and every change since has been applied on top of it in order using the LSN sequence."
+
+**"How does Auto Loader work here?"**
+> "Auto Loader uses the `cloudFiles` format in Databricks. It reads Parquet files from S3 as a streaming source — it detects new files automatically and only processes files it hasn't seen before using a checkpoint. We use `addNewColumns` schema evolution so new columns from the source are automatically added to the schema without pipeline failures. `rescuedDataColumn` captures any data that doesn't match the current schema into a side column rather than losing it."
+
+**"What is an LSN and why does it matter?"**
+> "LSN stands for Log Sequence Number — it's SQL Server's way of ordering every transaction in the transaction log. In the sequence_by struct we pass both commit_time and LSN to `create_auto_cdc_flow`. This ensures that if two changes happen in the same millisecond, they're still applied in the correct order. Without LSN ordering you could get race conditions where an update gets applied before the insert it depends on."
+
+**"What is operation 3 and why do you filter it?"**
+> "SQL Server Change Tracking operation codes: 1 = delete, 2 = insert, 3 = before-image of an update, 4 = after-image of an update. We filter out operation 3 — the before-image — because we only want to apply the final state of a change, not the intermediate state. Applying operation 3 would incorrectly revert rows to their pre-update values."
 
 **"How does the SCD2 silver layer work?"**
-> "Lakeflow uses `APPLY CHANGES INTO`. It takes the CDC events and maintains a history table — when a record changes, the old row gets `__IS_CURRENT` set to false and `__END_AT` stamped, and a new current row is inserted. The surrogate key `__SK_ID` uniquely identifies each version."
+> "Both flows feed `create_auto_cdc_flow` which manages the SCD2 logic. When a row changes, the old version gets `__IS_CURRENT` set to false and `__END_AT` stamped with the change time. A new current row is inserted with `__IS_CURRENT = true` and a new `__SK_ID` surrogate key. The sequence_by struct — commit_time + LSN + seqval — ensures changes are applied in exactly the right order even under high-volume concurrent writes."
 
 **"What does your gold layer actually do?"**
 > "I rewrite SQL string transforms as PySpark DataFrames. The transforms include multi-table joins — joining driver, vehicle, and route dimension tables. Window functions for latest-record deduplication. Date filtering — for example the production statistics table only includes the last 24 months of data. Column renames to align with business terminology. All tables filter `__IS_CURRENT = true` from silver before any transformation."
 
 ### Project Details
 - Company: Waste Connections (current role)
-- Stack: SQL Server CDC → AWS Glue → S3 → Auto Loader → Lakeflow DLT (SCD2 silver) → PySpark gold → Unity Catalog → Tableau
-- Silver layer: 147 TRUX tables, Lakeflow Declarative Pipelines, SCD2 via `APPLY CHANGES INTO`
+- Stack: SQL Server Change Tracking → AWS Glue → S3 (snapshot + CT Parquet files) → Auto Loader (cloudFiles streaming) → Lakeflow DLT (SCD2 silver via `create_auto_cdc_flow`) → PySpark gold → Unity Catalog → Tableau
+- Silver layer: 147 TRUX tables, two flows per table (snapshot `once=True` + continuous CT), SCD2 columns: `__IS_CURRENT`, `__START_AT`, `__END_AT`, `__SK_ID`
+- CT operation codes: 1=delete, 2=insert, 3=before-image (filtered out), 4=after-image
+- Sequence ordering: `sequence_by` struct with `__commit_time` + `__$start_lsn` + `__$seqval`
+- Schema evolution: `addNewColumns` mode + `rescuedDataColumn` for schema drift safety
 - Gold layer: 26 Python files (12 dims, 14 facts) under `src/TRUX_TABLEAU/transformations/gold/`
 - Deploy: `databricks bundle deploy --target local`
 - Gold layer rewrites completed: `trux_dim_driver`, `trux_dim_vehicle`, `trux_fact_route_production_statistics`, `trux_fact_invoice_detail`, `trux_fact_getcost`
@@ -171,9 +196,9 @@
 
 | Layer | Owner | What I know about it |
 |---|---|---|
-| SQL Server CDC | Source/DBA team | How it works conceptually — reads transaction log, captures change events |
-| AWS Glue / S3 landing | Platform team | Files land as Parquet snapshots in S3 |
-| Auto Loader + Lakeflow silver | Platform team | How it works — file notifications, checkpoint, `APPLY CHANGES INTO` SCD2 |
+| SQL Server Change Tracking | Source/DBA team | CT records key + operation code per changed row. Operation codes: 1=delete, 2=insert, 3=before-image (filtered), 4=after-image. Lighter than CDC — no full row capture needed because snapshot seeds the initial state. |
+| AWS Glue / S3 landing | Platform team | Two file types land in S3: snapshot Parquet (full extract, once) and CT Parquet (incremental, ongoing) |
+| Auto Loader + Lakeflow silver | Platform team | cloudFiles streaming, addNewColumns schema evolution, rescuedDataColumn, two flows per table (snapshot once=True + continuous CT), SCD2 via create_auto_cdc_flow with LSN-based sequencing |
 | Gold layer PySpark transforms | Me | Full ownership — wrote, deploy, maintain |
 | Asset Bundles deployment | Me | `databricks bundle deploy --target local` |
 | Unity Catalog tables | Me | Write gold layer tables here |
